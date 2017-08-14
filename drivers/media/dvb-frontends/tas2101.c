@@ -246,6 +246,7 @@ static int tas2101_read_signal_strength(struct dvb_frontend *fe,
 static int tas2101_read_snr(struct dvb_frontend *fe, u16 *snr)
 {
 	struct tas2101_priv *priv = fe->demodulator_priv;
+	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
 	int ret, i;
 	long val;
 	u16 snr_raw;
@@ -262,16 +263,20 @@ static int tas2101_read_snr(struct dvb_frontend *fe, u16 *snr)
 			break;
 
 	if( i == 0 )
-		*snr = tas2101_snrtable[i].snr;
+		val = tas2101_snrtable[i].snr;
 	else
 	{
 		/* linear interpolation between two calibrated values */
 		val = (snr_raw - tas2101_snrtable[i].raw) * tas2101_snrtable[i-1].snr;
 		val += (tas2101_snrtable[i-1].raw - snr_raw) * tas2101_snrtable[i].snr;
 		val /= (tas2101_snrtable[i-1].raw - tas2101_snrtable[i].raw);
-
-		*snr = (u16) val; /* dB / 10 */
 	}
+
+	c->cnr.len = 1;
+	c->cnr.stat[0].scale = FE_SCALE_DECIBEL;
+	c->cnr.stat[0].uvalue = 100 * (s64) val;
+
+	*snr = (u16) val * 328; /* 20dB = 100% */
 
 	dev_dbg(&priv->i2c->dev, "%s() snr = 0x%04x\n",
 		__func__, *snr);
@@ -286,6 +291,24 @@ static int tas2101_read_ucblocks(struct dvb_frontend *fe, u32 *ucblocks)
 	dev_dbg(&priv->i2c->dev, "%s()\n", __func__);
 	*ucblocks = 0;
 	return 0;
+}
+
+static void tas2101_spi_read(struct dvb_frontend *fe, struct ecp3_info *ecp3inf)
+{
+
+	struct tas2101_priv *priv = fe->demodulator_priv;
+	struct i2c_adapter *adapter = priv->i2c;
+	if (priv->cfg->read_properties)
+		priv->cfg->read_properties(adapter,ecp3inf->reg, &(ecp3inf->data));
+	return;
+}
+static void tas2101_spi_write(struct dvb_frontend *fe,struct ecp3_info *ecp3inf)
+{
+	struct tas2101_priv *priv = fe->demodulator_priv;
+	struct i2c_adapter *adapter = priv->i2c;
+	if (priv->cfg->write_properties)
+		priv->cfg->write_properties(adapter,ecp3inf->reg, ecp3inf->data);
+	return ;
 }
 
 static int tas2101_set_voltage(struct dvb_frontend *fe,
@@ -825,6 +848,67 @@ static int tas2101_get_algo(struct dvb_frontend *fe)
 	return DVBFE_ALGO_HW;
 }
 
+static int tas2101_get_spectrum_scan(struct dvb_frontend *fe, struct dvb_fe_spectrum_scan *s)
+{
+	struct tas2101_priv *priv = fe->demodulator_priv;
+	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
+	long dbm_raw;
+	int ret, x;
+	u32 sr;
+	u8 buf[3];
+
+	ret = tas2101_wrtable(priv, tas2101_setfe, ARRAY_SIZE(tas2101_setfe));
+	if (ret)
+		return ret;
+
+	c->symbol_rate		= 1000000;
+	c->delivery_system	= SYS_DVBS;
+
+	/* set symbol rate */
+	sr = c->symbol_rate / 1000;
+	buf[0] = SET_SRATE0;
+	buf[1] = (u8) sr;
+	buf[2] = (u8) (sr >> 8);
+	ret = tas2101_wrm(priv, buf, 3);
+	if (ret)
+		return ret;
+
+	/* clear freq offset */
+	buf[0] = FREQ_OS0;
+	buf[1] = 0;
+	buf[2] = 0;
+	ret = tas2101_wrm(priv, buf, 3);
+	if (ret)
+		return ret;
+
+	for (x = 0 ; x < s->num_freq ; x++)
+	{
+		c->frequency = *(s->freq + x);
+
+		if (fe->ops.tuner_ops.set_params) {
+	#ifndef TAS2101_USE_I2C_MUX
+			if (fe->ops.i2c_gate_ctrl)
+				fe->ops.i2c_gate_ctrl(fe, 1);
+	#endif
+			fe->ops.tuner_ops.set_params(fe);
+	#ifndef TAS2101_USE_I2C_MUX
+			if (fe->ops.i2c_gate_ctrl)
+				fe->ops.i2c_gate_ctrl(fe, 0);
+	#endif
+
+			msleep(100);
+
+			ret = tas2101_rdm(priv, SIGSTR_0, buf, 2);
+			if (ret)
+				return ret;
+			dbm_raw = (((u16)buf[1] & 0x0f) << 8) | buf[0];
+			dbm_raw = 4095 - dbm_raw;
+			*(s->rf_level + x) = dbm_raw;
+		}
+	}
+	return 0;
+}
+
 #ifndef TAS2101_USE_I2C_MUX
 static int tas2101_i2c_gate_ctrl(struct dvb_frontend* fe, int enable)
 {
@@ -855,7 +939,12 @@ static struct dvb_frontend_ops tas2101_ops = {
 			FE_CAN_FEC_4_5 | FE_CAN_FEC_5_6 | FE_CAN_FEC_6_7 |
 			FE_CAN_FEC_7_8 | FE_CAN_FEC_AUTO |
 			FE_CAN_2G_MODULATION |
-			FE_CAN_QPSK | FE_CAN_RECOVER
+			FE_CAN_QPSK | FE_CAN_RECOVER |
+			FE_HAS_EXTENDED_CAPS
+	},
+	.extended_info = {
+		.extended_caps          = FE_CAN_SPECTRUMSCAN |
+					  FE_CAN_BLINDSEARCH
 	},
 	.release = tas2101_release,
 
@@ -880,6 +969,10 @@ static struct dvb_frontend_ops tas2101_ops = {
 	.set_frontend = tas2101_set_frontend,
 	.get_frontend = tas2101_get_frontend,
 
+	.spi_read			= tas2101_spi_read,
+	.spi_write			= tas2101_spi_write,
+
+	.get_spectrum_scan = tas2101_get_spectrum_scan,
 };
 
 MODULE_DESCRIPTION("DVB Frontend module for Tmax TAS2101");
