@@ -316,6 +316,11 @@ struct analog_demod_ops {
 
 struct dtv_frontend_properties;
 
+struct dvb_frame {
+	int frame_size;
+	int packet_size;
+	int sync_byte;
+};
 
 /**
  * struct dvb_frontend_ops - Demodulation information and callbacks for
@@ -409,6 +414,7 @@ struct dtv_frontend_properties;
 struct dvb_frontend_ops {
 
 	struct dvb_frontend_info info;
+	struct dvb_frontend_extended_info extended_info;
 
 	u8 delsys[MAX_DELSYS];
 
@@ -469,6 +475,10 @@ struct dvb_frontend_ops {
 
 	int (*set_property)(struct dvb_frontend* fe, struct dtv_property* tvp);
 	int (*get_property)(struct dvb_frontend* fe, struct dtv_property* tvp);
+
+	int (*get_constellation_samples)(struct dvb_frontend* fe, struct dvb_fe_constellation_samples* s);
+	int (*get_spectrum_scan)(struct dvb_frontend* fe, struct dvb_fe_spectrum_scan* s);
+	int (*set_frame_ops)(struct dvb_frontend* fe, struct dvb_frame frame_ops);
 };
 
 #ifdef __DVB_CORE__
